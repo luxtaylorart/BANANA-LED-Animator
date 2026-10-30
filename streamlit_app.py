@@ -8,6 +8,7 @@ from led_core import (
     APP_TITLE,
     to_int, hsv_to_rgb, build_gradient, build_sections, apply_randomizer_slices,
     gen_chunk_code, gen_smooth_code, gen_blink_code, gen_random_code, gen_color_sequence_code,
+    gen_ticker_code, ticker_timing, apply_brightness, TICKER_PATTERNS,
 )
 
 st.set_page_config(page_title="Lux Taylor B.A.N.A.N.A", layout="wide")
@@ -47,12 +48,14 @@ WHITE, RED, BLUE = "#FFFFFF", "#FF0000", "#0000FF"
 st.sidebar.header("Settings")
 total_leds = int(st.sidebar.number_input("Total number LEDs", min_value=1, max_value=2000, value=50, step=1))
 data_pin = int(st.sidebar.number_input("Data Pin", min_value=0, max_value=50, value=6, step=1))
-anim = st.sidebar.selectbox("Animation Type", ["Chunk", "Smooth", "Blink", "Random", "Color Sequence"])
+anim = st.sidebar.selectbox("Animation Type", ["Chunk", "Smooth", "Blink", "Random", "Color Sequence", "Ticker"])
 
 st.sidebar.subheader("Run Mode")
-run_modes = ["Loop", "Trigger"] if anim == "Blink" else ["Loop", "Hold", "Trigger"]
+run_modes = ["Loop", "Trigger"] if anim in ("Blink", "Ticker") else ["Loop", "Hold", "Trigger"]
 rm = st.sidebar.selectbox("Run Mode", run_modes)
-trig = st.sidebar.selectbox("Trigger Type", ["limit switch", "pushbutton"], disabled=(rm != "Trigger"))
+trig = st.sidebar.selectbox("Trigger Type", ["limit switch", "pushbutton"], disabled=(rm != "Trigger"),
+                            help="Ticker: a limit switch runs it while held; each pushbutton press toggles it on or off."
+                            if anim == "Ticker" else None)
 input_pin = int(st.sidebar.number_input("Input Pin", min_value=0, max_value=50, value=2, step=1,
                                         disabled=(rm != "Trigger")))
 uses_timing = anim in ("Chunk", "Smooth", "Color Sequence")
@@ -72,6 +75,8 @@ st.sidebar.subheader("Extra Settings")
 ease_on = st.sidebar.checkbox("Animation Easing", value=False)
 ease_ms = int(st.sidebar.number_input("Ease Duration (ms)", min_value=0, max_value=600000, value=250, step=1,
                                       disabled=not ease_on))
+brightness = int(st.sidebar.slider("Brightness", min_value=1, max_value=255, value=255,
+                                   help="Scales every color. Lower brightness also lowers power draw."))
 
 base_params = {
     "total_leds": total_leds,
@@ -314,12 +319,107 @@ def colorseq_settings():
     return make
 
 
+TICKER_DEFAULT_COLORS = ["#FF5000", "#FF0000", "#00FF00", "#0000FF", "#FFFFFF",
+                         "#FF00FF", "#00FFFF", "#FFFF00", "#8000FF", "#FF0080"]
+TICKER_DEFAULTS = {"Wave": (450, 450, 150), "Sequence": (300, 300, 0), "Together": (500, 500, 0), "Alternate": (500, 500, 0)}
+
+
+def ticker_global_timing(pattern, n):
+    on_d, off_d, stg_d = TICKER_DEFAULTS[pattern]
+    key = pattern.lower()
+    on = st.session_state.get(f"tk_{key}_on", on_d)
+    off = st.session_state.get(f"tk_{key}_off", off_d)
+    stagger = st.session_state.get(f"tk_{key}_stagger", stg_d)
+    step = st.session_state.get(f"tk_{key}_step", on_d)
+    return ticker_timing(pattern, n, on, off, stagger, step)
+
+
+def seed_per_color():
+    if not st.session_state.get("tk_per_color"):
+        return
+    n = st.session_state.get("tk_num_colors", 3)
+    on, off, phase = ticker_global_timing(st.session_state.get("tk_pattern", "Wave"), n)
+    for c in range(n):
+        st.session_state[f"tk_pc_on_{c}"] = on[c]
+        st.session_state[f"tk_pc_off_{c}"] = off[c]
+        st.session_state[f"tk_pc_phase_{c}"] = phase[c]
+
+
+def ms_input(container, label, key, default, min_value=0):
+    if key not in st.session_state:
+        st.session_state[key] = default
+    return int(container.number_input(label, min_value=min_value, max_value=600000, step=1, key=key))
+
+
+def ticker_settings():
+    for k in list(st.session_state.keys()):
+        if k == "tk_pattern" or k.startswith("tk_pc_") or any(k.startswith(f"tk_{p.lower()}_") for p in TICKER_PATTERNS):
+            st.session_state[k] = st.session_state[k]
+    c1, c2 = st.columns(2)
+    chunk = int(c1.number_input("Chunk size (LEDs)", min_value=1, max_value=total_leds, value=min(3, total_leds), step=1,
+                                help="The strip is cut into chunks of this size; the last chunk is shorter if it doesn't divide evenly."))
+    n = int(c2.selectbox("Number of colors", list(range(1, 11)), index=2, key="tk_num_colors"))
+    full, rem = divmod(total_leds, chunk)
+    st.caption(f"{full} chunk(s) of {chunk}" + (f" + 1 chunk of {rem}" if rem else "") + f" across {total_leds} LEDs")
+    colors = color_grid("tk_color", [f"Color {i+1}" for i in range(n)], TICKER_DEFAULT_COLORS[:n] or ["#FFFFFF"], cols=5)
+
+    st.markdown("##### Timing")
+    per_color = st.checkbox("Per-color timing", value=False, key="tk_per_color", on_change=seed_per_color,
+                            help="Set on, off and start delay separately for each color. Starts from the current pattern's values.")
+    if not per_color:
+        pattern = st.selectbox("Pattern", TICKER_PATTERNS, key="tk_pattern")
+        key = pattern.lower()
+        on_d, off_d, stg_d = TICKER_DEFAULTS[pattern]
+        if pattern == "Sequence":
+            ms_input(st, "Step (ms each color is lit)", f"tk_{key}_step", on_d, min_value=1)
+            st.caption("One color at a time, in order.")
+        else:
+            cols = st.columns(3 if pattern == "Wave" else 2)
+            ms_input(cols[0], "On (ms)", f"tk_{key}_on", on_d)
+            ms_input(cols[1], "Off (ms)", f"tk_{key}_off", off_d)
+            if pattern == "Wave":
+                ms_input(cols[2], "Stagger between colors (ms)", f"tk_{key}_stagger", stg_d)
+                st.caption("Each color starts one stagger after the previous. Stagger ≥ On gives one color at a time; shorter overlaps.")
+            elif pattern == "Together":
+                st.caption("Every color flashes in unison.")
+            else:
+                st.caption("Odd and even colors blink opposite each other.")
+        on, off, phase = ticker_global_timing(pattern, n)
+    else:
+        on, off, phase = [], [], []
+        g_on, g_off, g_phase = ticker_global_timing(st.session_state.get("tk_pattern", "Wave"), n)
+        for c in range(n):
+            cols = st.columns(3)
+            on.append(ms_input(cols[0], f"Color {c+1} On (ms)", f"tk_pc_on_{c}", g_on[c]))
+            off.append(ms_input(cols[1], f"Color {c+1} Off (ms)", f"tk_pc_off_{c}", g_off[c]))
+            phase.append(ms_input(cols[2], f"Color {c+1} Start delay (ms)", f"tk_pc_phase_{c}", g_phase[c]))
+
+    st.markdown("##### Movement")
+    movement = st.radio("Movement", ["Static", "Scroll"], horizontal=True, key="tk_movement", label_visibility="collapsed")
+    scroll = movement == "Scroll"
+    reverse, step_ms, step_leds = False, 100, 1
+    if scroll:
+        c1, c2, c3 = st.columns(3)
+        reverse = c1.selectbox("Direction", ["Forward", "Reverse"], key="tk_dir") == "Reverse"
+        step_ms = int(c2.number_input("Step every (ms)", min_value=1, max_value=600000, value=100, step=1, key="tk_step_ms"))
+        step_leds = int(c3.number_input("Step size (LEDs)", min_value=1, max_value=max(1, chunk * n), value=1, step=1,
+                                        key="tk_step_leds"))
+
+    def make():
+        return gen_ticker_code({**base_params, "ticker_chunk_size": chunk, "ticker_colors": colors,
+                                "ticker_on_ms": on, "ticker_off_ms": off, "ticker_phase_ms": phase,
+                                "ticker_scroll": scroll, "ticker_reverse": reverse,
+                                "ticker_step_ms": step_ms, "ticker_step_leds": step_leds})
+    return make
+
+
 builders = {
     "Chunk": chunk_settings,
     "Smooth": smooth_settings,
     "Blink": blink_settings,
     "Random": random_settings,
     "Color Sequence": colorseq_settings,
+    "Ticker": ticker_settings,
 }
 make_sketch = builders[anim]()
 
@@ -328,7 +428,7 @@ def settings_fingerprint():
     state = random.getstate()
     random.seed(0)
     try:
-        return make_sketch()
+        return apply_brightness(make_sketch(), brightness)
     finally:
         random.setstate(state)
 
@@ -336,7 +436,7 @@ def settings_fingerprint():
 st.markdown("---")
 current_fp = settings_fingerprint()
 if st.button("Generate Code", type="primary"):
-    st.session_state.sketch = make_sketch()
+    st.session_state.sketch = apply_brightness(make_sketch(), brightness)
     st.session_state.sketch_fp = current_fp
 
 sketch = st.session_state.get("sketch")

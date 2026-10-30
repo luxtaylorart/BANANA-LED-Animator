@@ -1117,3 +1117,187 @@ void loop() {{
   easeAllTo(stepColors[idx]);
 }"""
     return code.strip()
+
+
+TICKER_PATTERNS = ["Wave", "Sequence", "Together", "Alternate"]
+
+
+def ticker_timing(pattern, num_colors, on_ms, off_ms, stagger_ms, step_ms):
+    n = max(1, num_colors)
+    if pattern == "Sequence":
+        on = [step_ms] * n
+        off = [step_ms * (n - 1)] * n
+        phase = [c * step_ms for c in range(n)]
+    elif pattern == "Together":
+        on, off, phase = [on_ms] * n, [off_ms] * n, [0] * n
+    elif pattern == "Alternate":
+        on, off = [on_ms] * n, [off_ms] * n
+        phase = [(c % 2) * on_ms for c in range(n)]
+    else:
+        on, off = [on_ms] * n, [off_ms] * n
+        phase = [c * stagger_ms for c in range(n)]
+    return on, off, phase
+
+
+def apply_brightness(code, brightness):
+    b = to_int(brightness, 255, 1, 255)
+    if b >= 255:
+        return code
+    return code.replace("  strip.begin();\n", f"  strip.begin();\n  strip.setBrightness({b});\n", 1)
+
+
+def gen_ticker_code(params):
+    total = params["total_leds"]
+    pin = params["data_pin"]
+    input_pin = params["input_pin"]
+    run_mode = params["run_mode"]
+    chunk = max(1, min(total, params["ticker_chunk_size"]))
+    colors = params["ticker_colors"]
+    n = len(colors)
+    on_ms = params["ticker_on_ms"]
+    off_ms = params["ticker_off_ms"]
+    phase_ms = params["ticker_phase_ms"]
+    scroll = params.get("ticker_scroll", False)
+    reverse = params.get("ticker_reverse", False)
+    step_ms = max(1, to_int(params.get("ticker_step_ms", 100), 100, 1, 600000))
+    step_leds = max(1, to_int(params.get("ticker_step_leds", 1), 1, 1, 100000))
+    ease_on = params.get("ease_on", False)
+    ease_ms = to_int(params.get("ease_ms", 0), 0, 0, 600000) if ease_on else 0
+
+    def arr(vals):
+        return ", ".join(f"{to_int(v, 0, 0, 600000)}UL" for v in vals)
+
+    color_arr = ", ".join(f"0x{(r << 16) | (g << 8) | b:06X}UL" for (r, g, b) in colors)
+
+    code = f"""#include <Adafruit_NeoPixel.h>
+#define LED_PIN {pin}
+#define NUM_LEDS {total}
+#define INPUT_PIN {input_pin}
+#define CHUNK_SIZE {chunk}
+#define NUM_COLORS {n}
+#define PATTERN_LEN ((long)CHUNK_SIZE * NUM_COLORS)
+Adafruit_NeoPixel strip(NUM_LEDS, LED_PIN, NEO_GRB + NEO_KHZ800);
+const uint32_t COLORS[NUM_COLORS] = {{{color_arr}}};
+const unsigned long ON_MS[NUM_COLORS] = {{{arr(on_ms)}}};
+const unsigned long OFF_MS[NUM_COLORS] = {{{arr(off_ms)}}};
+const unsigned long PHASE_MS[NUM_COLORS] = {{{arr(phase_ms)}}};
+const bool SCROLL = {"true" if scroll else "false"};
+const bool SCROLL_REVERSE = {"true" if reverse else "false"};
+const unsigned long STEP_MS = {step_ms}UL;
+const long STEP_LEDS = {step_leds}L;
+const unsigned long EASE_MS = {ease_ms}UL;
+const unsigned long EASE_DIV = EASE_MS ? EASE_MS : 1UL;
+
+uint8_t level[NUM_COLORS];
+long lastOffset = -1;
+bool active = false;
+bool stopping = false;
+unsigned long startMs = 0;
+unsigned long stopMs = 0;
+
+uint8_t colorLevel(int c, unsigned long elapsed) {{
+  unsigned long period = ON_MS[c] + OFF_MS[c];
+  if (period == 0 || ON_MS[c] == 0) return 0;
+  if (OFF_MS[c] == 0) return 255;
+  unsigned long pos = (elapsed + period - (PHASE_MS[c] % period)) % period;
+  if (EASE_MS == 0) return pos < ON_MS[c] ? 255 : 0;
+  if (pos < ON_MS[c]) return pos >= EASE_MS ? 255 : (uint8_t)((pos * 255UL) / EASE_DIV);
+  unsigned long peak = ON_MS[c] >= EASE_MS ? 255UL : (ON_MS[c] * 255UL) / EASE_DIV;
+  unsigned long d = pos - ON_MS[c];
+  if (d >= EASE_MS) return 0;
+  return (uint8_t)(peak - (peak * d) / EASE_DIV);
+}}
+
+uint32_t scaled(uint32_t c, uint8_t l) {{
+  if (l == 255) return c;
+  if (l == 0) return 0;
+  uint8_t r = (uint8_t)(((c >> 16) & 0xFF) * l / 255);
+  uint8_t g = (uint8_t)(((c >> 8) & 0xFF) * l / 255);
+  uint8_t b = (uint8_t)((c & 0xFF) * l / 255);
+  return strip.Color(r, g, b);
+}}
+
+void render(unsigned long elapsed, uint8_t master) {{
+  bool changed = false;
+  for (int c = 0; c < NUM_COLORS; c++) {{
+    uint8_t l = (uint8_t)(((uint16_t)colorLevel(c, elapsed) * master) / 255);
+    if (l != level[c]) {{ level[c] = l; changed = true; }}
+  }}
+  long offset = 0;
+  if (SCROLL) offset = (long)(((elapsed / STEP_MS) % PATTERN_LEN) * STEP_LEDS % PATTERN_LEN);
+  if (offset != lastOffset) {{ lastOffset = offset; changed = true; }}
+  if (!changed) return;
+  for (int i = 0; i < NUM_LEDS; i++) {{
+    long p = SCROLL_REVERSE ? (long)i + offset : (long)i - offset;
+    p %= PATTERN_LEN;
+    if (p < 0) p += PATTERN_LEN;
+    int c = (int)(p / CHUNK_SIZE);
+    strip.setPixelColor(i, scaled(COLORS[c], level[c]));
+  }}
+  strip.show();
+}}
+
+void startTicker(unsigned long now) {{
+  active = true;
+  stopping = false;
+  startMs = now;
+  lastOffset = -1;
+}}
+
+void stopTicker(unsigned long now) {{
+  if (!active || stopping) return;
+  stopping = true;
+  stopMs = now;
+}}
+
+void setup() {{
+  pinMode(INPUT_PIN, INPUT_PULLUP);
+  strip.begin();
+  strip.clear();
+  strip.show();
+}}
+
+void loop() {{
+  unsigned long now = millis();
+"""
+    if run_mode == "trigger_limit":
+        code += """  if (digitalRead(INPUT_PIN) == LOW) {
+    if (!active || stopping) startTicker(now);
+  } else {
+    stopTicker(now);
+  }
+"""
+    elif run_mode == "trigger_push":
+        code += """  static int lastRaw = HIGH;
+  static int stable = HIGH;
+  static unsigned long lastChange = 0;
+  int raw = digitalRead(INPUT_PIN);
+  if (raw != lastRaw) { lastRaw = raw; lastChange = now; }
+  if (now - lastChange >= 30UL && raw != stable) {
+    stable = raw;
+    if (stable == LOW) {
+      if (active && !stopping) stopTicker(now);
+      else startTicker(now);
+    }
+  }
+"""
+    else:
+        code += """  if (!active) startTicker(now);
+"""
+    code += """  if (!active) return;
+  uint8_t master = 255;
+  if (stopping) {
+    unsigned long d = now - stopMs;
+    if (d >= EASE_MS) {
+      active = false;
+      stopping = false;
+      for (int c = 0; c < NUM_COLORS; c++) level[c] = 0;
+      strip.clear();
+      strip.show();
+      return;
+    }
+    master = (uint8_t)(255UL - (d * 255UL) / EASE_DIV);
+  }
+  render(now - startMs, master);
+}"""
+    return code.strip()

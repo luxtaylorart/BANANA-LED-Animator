@@ -23,8 +23,11 @@
 | **Blink** | Blinks sections together, in sequence, at random, or in a custom order |
 | **Random** | Random chunks flash on and off, optionally several at once, in solid, chosen, or random colors |
 | **Color Sequence** | Steps the whole strip through a list of colors |
+| **Ticker** | Marquee-style flashing: up to 10 colors in repeating chunks, with Wave / Sequence / Together / Alternate timing or per-color timing, either flashing in place or scrolling along the strip |
 
-**Animation Easing** (under Extra Settings) fades between states instead of switching instantly.
+**Animation Easing** (under Extra Settings) fades between states instead of switching instantly. **Brightness** scales every color, and lowers power draw too.
+
+In Ticker, a limit switch runs the animation while held, and each pushbutton press toggles it on or off.
 
 ## Notes
 
